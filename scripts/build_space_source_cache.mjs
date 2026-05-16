@@ -6,6 +6,9 @@ const MAX_LATEST = 600;
 const MAX_HOT = 200;
 const MAX_PER_INTEREST = 220;
 const TTL_HOURS = Number(process.env.SPACE_SOURCE_TTL_HOURS || 72);
+const WEIBO_COOKIE = String(process.env.WEIBO_COOKIE || process.env.SPACE_WEIBO_COOKIE || "").trim();
+const WEIBO_KEYWORDS = String(process.env.WEIBO_KEYWORDS || process.env.SPACE_WEIBO_KEYWORDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 20);
+const WEIBO_UIDS = String(process.env.WEIBO_UIDS || process.env.SPACE_WEIBO_UIDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 40);
 
 const INTERESTS = {
   acg: ["二次元", "动漫", "动画", "漫画", "番剧", "同人", "谷子", "手办", "cos", "虚拟主播", "国创"],
@@ -64,6 +67,22 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(num) ? num : fallback;
 }
 
+function stripHtml(value) {
+  return safeString(value)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function hashString(input) {
   const text = safeString(input);
   let hash = 0;
@@ -111,6 +130,7 @@ function material(input) {
     id: safeString(input.id || url || `${source}_${hashString(`${title}:${summary}:${content}`)}`),
     source,
     sourceLabel: input.sourceLabel || source,
+    kind: input.kind || "post",
     title,
     summary,
     content,
@@ -149,6 +169,26 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+async function fetchText(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, {
+      method: options.method || "GET",
+      headers: {
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        ...(options.headers || {})
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`${response.status} ${url}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function sourceBilibiliPopular() {
   const data = await fetchJson("https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1");
   return (data?.data?.list || []).map((item) => material({
@@ -182,6 +222,123 @@ async function sourceToutiaoHot() {
     heat: item.HotValue,
     tags: ["social"]
   })).filter(Boolean);
+}
+
+async function sourceWeiboHot() {
+  const data = await fetchJson("https://weibo.com/ajax/side/hotSearch", {
+    headers: {
+      Referer: "https://weibo.com/hot/search",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+    }
+  });
+  const list = data?.data?.realtime || data?.data?.band_list || [];
+  return list.map((item, index) => {
+    const word = safeString(item.word_scheme || item.word || item.note || item.title);
+    const cleanWord = word.replace(/^#|#$/g, "");
+    const tag = safeString(item.label_name || item.icon_desc || item.small_icon_desc);
+    const summaryParts = [
+      cleanWord,
+      item.note && item.note !== cleanWord ? item.note : "",
+      item.subject_label ? `${item.subject_label}领域热搜` : "",
+      tag ? `微博标记：${tag}` : ""
+    ].filter(Boolean);
+    return material({
+      source: "weibo",
+      sourceLabel: "微博热搜",
+      kind: "hotTopic",
+      id: item.mid || item.id || item.word || item.word_scheme || `weibo_hot_${index}_${hashString(cleanWord)}`,
+      title: cleanWord,
+      summary: summaryParts.join(" / "),
+      url: cleanWord ? `https://s.weibo.com/weibo?q=${encodeURIComponent(cleanWord)}` : "https://weibo.com/hot/search",
+      heat: item.num || item.raw_hot || item.hotValue || item.rank || 0,
+      tags: ["social", "weibo", item.subject_label, tag].filter(Boolean)
+    });
+  }).filter(Boolean);
+}
+
+function normalizeWeiboStatus(item) {
+  const user = item?.user || {};
+  const text = stripHtml(item?.text_raw || item?.text || item?.longText?.longTextContent || "");
+  if (!text || text.length < 8) return null;
+  const id = safeString(item.idstr || item.mblogid || item.mid || `${user.idstr || user.id}_${hashString(text)}`);
+  const sourceUrl = item.mblogid
+    ? `https://weibo.com/${user.idstr || user.id || "u"}/${item.mblogid}`
+    : (id ? `https://weibo.com/detail/${id}` : "");
+  return material({
+    source: "weibo",
+    sourceLabel: "微博公开内容",
+    kind: "post",
+    id,
+    title: compactText(text, 80),
+    content: text,
+    url: sourceUrl,
+    image: item.pic_infos ? Object.values(item.pic_infos)[0]?.large?.url || Object.values(item.pic_infos)[0]?.thumbnail?.url : "",
+    authorName: user.screen_name || user.name || "微博用户",
+    heat: item.attitudes_count || item.reposts_count || 0,
+    likes: item.attitudes_count,
+    comments: item.comments_count,
+    publishedAt: item.created_at ? new Date(item.created_at).toISOString() : nowIso(),
+    tags: ["social", "weibo"]
+  });
+}
+
+async function sourceWeiboTimeline() {
+  if (!WEIBO_COOKIE) return [];
+  const data = await fetchJson("https://weibo.com/ajax/feed/hottimeline?refresh=2&group_id=102803&containerid=102803&extparam=discover%7Cnew_feed&max_id=0&count=20", {
+    headers: {
+      Referer: "https://weibo.com/",
+      Cookie: WEIBO_COOKIE,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+    }
+  });
+  const list = data?.statuses || data?.data?.statuses || data?.data || [];
+  return (Array.isArray(list) ? list : []).map(normalizeWeiboStatus).filter(Boolean);
+}
+
+function weiboHeaders(referer = "https://weibo.com/") {
+  return {
+    Referer: referer,
+    Cookie: WEIBO_COOKIE,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+  };
+}
+
+function normalizeWeiboStatusDeep(item) {
+  const status = item?.mblog || item?.status || item;
+  const user = status?.user || item?.user || {};
+  return normalizeWeiboStatus({ ...status, user });
+}
+
+function extractWeiboCards(data) {
+  const direct = data?.statuses || data?.data?.statuses || data?.data?.list || data?.list;
+  if (Array.isArray(direct)) return direct;
+  const cards = data?.data?.cards || data?.cards || [];
+  if (!Array.isArray(cards)) return [];
+  return cards.flatMap((card) => card?.card_group || card?.group || [card]).filter(Boolean);
+}
+
+async function sourceWeiboSearchPosts() {
+  if (!WEIBO_COOKIE || !WEIBO_KEYWORDS.length) return [];
+  const batches = await Promise.all(WEIBO_KEYWORDS.map(async (keyword) => {
+    const url = `https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26t%3D10%26q%3D${encodeURIComponent(keyword)}&page_type=searchall&page=1`;
+    const data = await fetchJson(url, { headers: weiboHeaders("https://m.weibo.cn/") });
+    return extractWeiboCards(data).map((item) => {
+      const post = normalizeWeiboStatusDeep(item);
+      if (post) post.tags = Array.from(new Set([...(post.tags || []), keyword]));
+      return post;
+    }).filter(Boolean);
+  }));
+  return batches.flat();
+}
+
+async function sourceWeiboUserPosts() {
+  if (!WEIBO_COOKIE || !WEIBO_UIDS.length) return [];
+  const batches = await Promise.all(WEIBO_UIDS.map(async (uid) => {
+    const url = `https://m.weibo.cn/api/container/getIndex?containerid=107603${encodeURIComponent(uid)}&page=1`;
+    const data = await fetchJson(url, { headers: weiboHeaders("https://m.weibo.cn/") });
+    return extractWeiboCards(data).map(normalizeWeiboStatusDeep).filter(Boolean);
+  }));
+  return batches.flat();
 }
 
 async function sourceDouyinHot() {
@@ -239,6 +396,10 @@ async function sourceV2exHot() {
 
 async function collect() {
   const tasks = [
+    ["weibo-timeline", sourceWeiboTimeline],
+    ["weibo-search-posts", sourceWeiboSearchPosts],
+    ["weibo-user-posts", sourceWeiboUserPosts],
+    ["weibo", sourceWeiboHot],
     ["bilibili", sourceBilibiliPopular],
     ["toutiao", sourceToutiaoHot],
     ["douyin", sourceDouyinHot],
@@ -274,12 +435,14 @@ async function writeJson(relativePath, payload) {
 
 async function main() {
   const items = await collect();
+  const latestItems = items.filter((item) => item.kind !== "hotTopic");
+  const hotItems = items.filter((item) => item.kind === "hotTopic").concat(latestItems);
   const meta = { ok: true, generatedAt: nowIso(), count: items.length, ttlHours: TTL_HOURS };
-  await writeJson("latest.json", { ...meta, items: items.slice(0, MAX_LATEST) });
-  await writeJson("hot.json", { ...meta, items: items.slice(0, MAX_HOT) });
+  await writeJson("latest.json", { ...meta, count: latestItems.length, items: latestItems.slice(0, MAX_LATEST) });
+  await writeJson("hot.json", { ...meta, count: hotItems.length, items: hotItems.slice(0, MAX_HOT) });
 
   for (const key of Object.keys(INTERESTS)) {
-    const list = items.filter((item) => item.tags?.includes(key)).slice(0, MAX_PER_INTEREST);
+    const list = latestItems.filter((item) => item.tags?.includes(key)).slice(0, MAX_PER_INTEREST);
     await writeJson(`interests/${key}.json`, { ...meta, interest: key, count: list.length, items: list });
   }
   await writeJson("index.json", {
