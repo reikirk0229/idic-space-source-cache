@@ -27,6 +27,10 @@ jobs:
           node-version: "22"
 
       - name: Build cache
+        env:
+          WEIBO_COOKIE: ${{ secrets.WEIBO_COOKIE }}
+          WEIBO_KEYWORDS: ${{ vars.WEIBO_KEYWORDS }}
+          WEIBO_UIDS: ${{ vars.WEIBO_UIDS }}
         run: node scripts/build_space_source_cache.mjs
 
       - name: Upload Pages artifact
