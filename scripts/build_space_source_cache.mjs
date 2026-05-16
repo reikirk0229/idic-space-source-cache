@@ -9,6 +9,7 @@ const TTL_HOURS = Number(process.env.SPACE_SOURCE_TTL_HOURS || 72);
 const WEIBO_COOKIE = String(process.env.WEIBO_COOKIE || process.env.SPACE_WEIBO_COOKIE || "").trim();
 const WEIBO_KEYWORDS = String(process.env.WEIBO_KEYWORDS || process.env.SPACE_WEIBO_KEYWORDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 20);
 const WEIBO_UIDS = String(process.env.WEIBO_UIDS || process.env.SPACE_WEIBO_UIDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 40);
+const WEIBO_SEARCH_PAGES = Math.max(1, Math.min(5, Number(process.env.WEIBO_SEARCH_PAGES || process.env.SPACE_WEIBO_SEARCH_PAGES || 2)));
 
 const INTERESTS = {
   acg: ["二次元", "动漫", "动画", "漫画", "番剧", "同人", "谷子", "手办", "cos", "虚拟主播", "国创"],
@@ -320,13 +321,20 @@ function extractWeiboCards(data) {
 async function sourceWeiboSearchPosts() {
   if (!WEIBO_COOKIE || !WEIBO_KEYWORDS.length) return [];
   const batches = await Promise.all(WEIBO_KEYWORDS.map(async (keyword) => {
-    const url = `https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26t%3D10%26q%3D${encodeURIComponent(keyword)}&page_type=searchall&page=1`;
-    const data = await fetchJson(url, { headers: weiboHeaders("https://m.weibo.cn/") });
-    return extractWeiboCards(data).map((item) => {
-      const post = normalizeWeiboStatusDeep(item);
-      if (post) post.tags = Array.from(new Set([...(post.tags || []), keyword]));
-      return post;
-    }).filter(Boolean);
+    const pages = await Promise.all(Array.from({ length: WEIBO_SEARCH_PAGES }, async (_, index) => {
+      const page = index + 1;
+      // m.weibo.cn 的 searchall 更接近综合/热门相关排序，不是严格时间倒序广场流。
+      const url = `https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26t%3D10%26q%3D${encodeURIComponent(keyword)}&page_type=searchall&page=${page}`;
+      const data = await fetchJson(url, { headers: weiboHeaders("https://m.weibo.cn/") });
+      return extractWeiboCards(data).map((item) => {
+        const post = normalizeWeiboStatusDeep(item);
+        if (post) post.tags = Array.from(new Set([...(post.tags || []), keyword]));
+        return post;
+      }).filter(Boolean);
+    }));
+    const posts = pages.flat();
+    console.log(`[source-cache] weibo-search-posts keyword="${keyword}" pages=${WEIBO_SEARCH_PAGES} order=searchall/hot-related count=${posts.length}`);
+    return posts;
   }));
   return batches.flat();
 }
@@ -399,16 +407,13 @@ async function collect() {
     ["weibo-timeline", sourceWeiboTimeline],
     ["weibo-search-posts", sourceWeiboSearchPosts],
     ["weibo-user-posts", sourceWeiboUserPosts],
-    ["weibo", sourceWeiboHot],
-    ["bilibili", sourceBilibiliPopular],
-    ["toutiao", sourceToutiaoHot],
-    ["douyin", sourceDouyinHot],
-    ["juejin", sourceJuejinHot],
-    ["v2ex", sourceV2exHot]
+    ["weibo-hot", sourceWeiboHot]
   ];
   const batches = await Promise.all(tasks.map(async ([name, fn]) => {
     try {
-      return await fn();
+      const items = await fn();
+      console.log(`[source-cache] ${name} ok count=${items.length}`);
+      return items;
     } catch (error) {
       console.warn(`[source-cache] ${name} failed: ${error.message}`);
       return [];
@@ -435,8 +440,8 @@ async function writeJson(relativePath, payload) {
 
 async function main() {
   const items = await collect();
-  const latestItems = items.filter((item) => item.kind !== "hotTopic");
-  const hotItems = items.filter((item) => item.kind === "hotTopic").concat(latestItems);
+  const latestItems = items.filter((item) => item.source === "weibo" && item.kind !== "hotTopic");
+  const hotItems = items.filter((item) => item.source === "weibo" && item.kind === "hotTopic");
   const meta = { ok: true, generatedAt: nowIso(), count: items.length, ttlHours: TTL_HOURS };
   await writeJson("latest.json", { ...meta, count: latestItems.length, items: latestItems.slice(0, MAX_LATEST) });
   await writeJson("hot.json", { ...meta, count: hotItems.length, items: hotItems.slice(0, MAX_HOT) });
