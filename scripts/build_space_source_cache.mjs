@@ -179,7 +179,7 @@ function material(input) {
   const source = safeString(input.source, "unknown");
   const title = compactText(input.title || input.word || input.name, 160);
   const summary = compactText(input.summary || input.desc || input.description || input.brief, 900);
-  const content = compactText(input.content || input.text || "", 6000);
+  const content = safeString(input.content || input.text || "");
   if (!title && !summary && !content) return null;
   const url = normalizeUrl(input.url || input.link || input.uri);
   const item = {
