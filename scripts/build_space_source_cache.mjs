@@ -2,15 +2,15 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const OUT_DIR = process.env.SPACE_SOURCE_OUT_DIR || "public";
-const MAX_LATEST = 600;
+const MAX_LATEST = 1600;
 const MAX_HOT = 200;
-const MAX_PER_INTEREST = 220;
-const TTL_HOURS = Number(process.env.SPACE_SOURCE_TTL_HOURS || 72);
+const MAX_PER_INTEREST = 500;
+const TTL_HOURS = Number(process.env.SPACE_SOURCE_TTL_HOURS || 168);
 const WEIBO_COOKIE = String(process.env.WEIBO_COOKIE || process.env.SPACE_WEIBO_COOKIE || "").trim();
 const RAW_WEIBO_KEYWORDS = String(process.env.WEIBO_KEYWORDS || process.env.SPACE_WEIBO_KEYWORDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean);
-const WEIBO_KEYWORD_LIMIT = Math.max(8, Math.min(80, Number(process.env.WEIBO_KEYWORD_LIMIT || process.env.SPACE_WEIBO_KEYWORD_LIMIT || 48)));
+const WEIBO_KEYWORD_LIMIT = Math.max(8, Math.min(140, Number(process.env.WEIBO_KEYWORD_LIMIT || process.env.SPACE_WEIBO_KEYWORD_LIMIT || 96)));
 const WEIBO_UIDS = String(process.env.WEIBO_UIDS || process.env.SPACE_WEIBO_UIDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 40);
-const WEIBO_SEARCH_PAGES = Math.max(1, Math.min(8, Number(process.env.WEIBO_SEARCH_PAGES || process.env.SPACE_WEIBO_SEARCH_PAGES || 4)));
+const WEIBO_SEARCH_PAGES = Math.max(1, Math.min(12, Number(process.env.WEIBO_SEARCH_PAGES || process.env.SPACE_WEIBO_SEARCH_PAGES || 6)));
 
 const INTERESTS = {
   acg: ["二次元", "动漫", "动画", "漫画", "番剧", "同人", "谷子", "手办", "cos", "虚拟主播", "国创"],
@@ -178,6 +178,9 @@ function material(input) {
     content,
     url,
     image: normalizeUrl(input.image || input.cover || input.pic),
+    images: Array.isArray(input.images) ? input.images.map(normalizeUrl).filter(Boolean) : [],
+    mediaType: safeString(input.mediaType),
+    mediaDescriptions: Array.isArray(input.mediaDescriptions) ? input.mediaDescriptions.map((item) => compactText(item, 240)).filter(Boolean) : [],
     authorName: safeString(input.authorName || input.author),
     heat: toNumber(input.heat || input.hot || input.view || input.likes, 0),
     likes: toNumber(input.likes || input.like || input.digg, 0),
@@ -322,6 +325,12 @@ function normalizeWeiboStatus(item) {
   const sourceUrl = item.mblogid
     ? `https://weibo.com/${user.idstr || user.id || "u"}/${item.mblogid}`
     : (id ? `https://weibo.com/detail/${id}` : "");
+  const pics = item.pic_infos ? Object.values(item.pic_infos) : [];
+  const pageInfo = item.page_info || item.pageInfo || item.video || {};
+  const hasVideo = /video/i.test(safeString(pageInfo.type || pageInfo.object_type || item.object_type)) || Boolean(pageInfo.media_info || pageInfo.urls || item.video);
+  const images = pics
+    .map((pic) => pic?.large?.url || pic?.largest?.url || pic?.original?.url || pic?.thumbnail?.url || "")
+    .filter(Boolean);
   return material({
     source: "weibo",
     sourceLabel: "微博公开内容",
@@ -330,7 +339,9 @@ function normalizeWeiboStatus(item) {
     title: compactText(text, 80),
     content: text,
     url: sourceUrl,
-    image: item.pic_infos ? Object.values(item.pic_infos)[0]?.large?.url || Object.values(item.pic_infos)[0]?.thumbnail?.url : "",
+    image: images[0] || "",
+    images,
+    mediaType: hasVideo ? "video" : images.length ? "image" : "",
     authorName: user.screen_name || user.name || "微博用户",
     heat: item.attitudes_count || item.reposts_count || 0,
     likes: item.attitudes_count,
@@ -379,7 +390,7 @@ function extractWeiboCards(data) {
 async function sourceWeiboSearchPosts() {
   if (!WEIBO_COOKIE || !WEIBO_KEYWORDS.length) return [];
   console.log(`[source-cache] weibo-search-posts keywords=${WEIBO_KEYWORDS.length} pages=${WEIBO_SEARCH_PAGES}`);
-  const batches = await mapWithConcurrency(WEIBO_KEYWORDS, 6, async (keyword) => {
+  const batches = await mapWithConcurrency(WEIBO_KEYWORDS, 8, async (keyword) => {
     const keywordTags = interestTagsForKeyword(keyword);
     const pages = [];
     for (let index = 0; index < WEIBO_SEARCH_PAGES; index += 1) {
