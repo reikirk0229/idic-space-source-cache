@@ -143,6 +143,20 @@ function classify(item) {
   return Array.from(new Set(tags.length ? tags : ["general"]));
 }
 
+function isJunkWeiboText(value) {
+  const text = safeString(value).toLowerCase();
+  if (!text) return false;
+  if (/阳光信用|信用互助|互赞|互评|互助互动|互动互助|转赞评|转评赞|求赞|求评|求互动|涨粉|养号|来访必回|暖贴|水贴|捞一下|扩列|15字|十五字|刷赞|刷评/.test(text)) return true;
+  if (/超话/.test(text) && /互助|互动|签到|水贴|捞|暖|15字|十五字|评论|转发/.test(text)) return true;
+  if (/互/.test(text) && /宝宝|宝子|互访|互暖|互捞|互关|互fo/.test(text)) return true;
+  return false;
+}
+
+function isJunkWeiboItem(item) {
+  if (item?.source !== "weibo" || item?.kind === "hotTopic") return false;
+  return isJunkWeiboText(`${item.authorName || ""} ${item.title || ""} ${item.summary || ""} ${item.content || ""}`);
+}
+
 function interestTagsForKeyword(keyword) {
   const text = safeString(keyword).toLowerCase();
   if (!text) return [];
@@ -182,6 +196,9 @@ function material(input) {
     mediaType: safeString(input.mediaType),
     mediaDescriptions: Array.isArray(input.mediaDescriptions) ? input.mediaDescriptions.map((item) => compactText(item, 240)).filter(Boolean) : [],
     authorName: safeString(input.authorName || input.author),
+    avatar: normalizeUrl(input.avatar || input.authorAvatar),
+    authorDesc: compactText(input.authorDesc || input.verifiedReason || "", 240),
+    verification: safeString(input.verification),
     heat: toNumber(input.heat || input.hot || input.view || input.likes, 0),
     likes: toNumber(input.likes || input.like || input.digg, 0),
     comments: toNumber(input.comments || input.reply || input.comment, 0),
@@ -191,6 +208,7 @@ function material(input) {
     tags: Array.isArray(input.tags) ? input.tags : []
   };
   item.tags = Array.from(new Set([...item.tags, ...classify(item)]));
+  if (isJunkWeiboItem(item)) return null;
   return item;
 }
 
@@ -343,6 +361,9 @@ function normalizeWeiboStatus(item) {
     images,
     mediaType: hasVideo ? "video" : images.length ? "image" : "",
     authorName: user.screen_name || user.name || "微博用户",
+    avatar: user.avatar_hd || user.avatar_large || user.profile_image_url,
+    authorDesc: user.description || user.verified_reason,
+    verification: user.verified ? "verified" : "",
     heat: item.attitudes_count || item.reposts_count || 0,
     likes: item.attitudes_count,
     comments: item.comments_count,
