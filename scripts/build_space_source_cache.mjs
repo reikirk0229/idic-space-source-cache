@@ -7,9 +7,10 @@ const MAX_HOT = 200;
 const MAX_PER_INTEREST = 220;
 const TTL_HOURS = Number(process.env.SPACE_SOURCE_TTL_HOURS || 72);
 const WEIBO_COOKIE = String(process.env.WEIBO_COOKIE || process.env.SPACE_WEIBO_COOKIE || "").trim();
-const WEIBO_KEYWORDS = String(process.env.WEIBO_KEYWORDS || process.env.SPACE_WEIBO_KEYWORDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 20);
+const RAW_WEIBO_KEYWORDS = String(process.env.WEIBO_KEYWORDS || process.env.SPACE_WEIBO_KEYWORDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean);
+const WEIBO_KEYWORD_LIMIT = Math.max(8, Math.min(80, Number(process.env.WEIBO_KEYWORD_LIMIT || process.env.SPACE_WEIBO_KEYWORD_LIMIT || 48)));
 const WEIBO_UIDS = String(process.env.WEIBO_UIDS || process.env.SPACE_WEIBO_UIDS || "").split(/[,，;\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 40);
-const WEIBO_SEARCH_PAGES = Math.max(1, Math.min(5, Number(process.env.WEIBO_SEARCH_PAGES || process.env.SPACE_WEIBO_SEARCH_PAGES || 2)));
+const WEIBO_SEARCH_PAGES = Math.max(1, Math.min(8, Number(process.env.WEIBO_SEARCH_PAGES || process.env.SPACE_WEIBO_SEARCH_PAGES || 4)));
 
 const INTERESTS = {
   acg: ["二次元", "动漫", "动画", "漫画", "番剧", "同人", "谷子", "手办", "cos", "虚拟主播", "国创"],
@@ -40,6 +41,28 @@ const INTERESTS = {
   "local-life": ["本地", "同城", "周末去哪", "市集", "探店", "展会", "活动"],
   general: []
 };
+
+function uniqueStrings(list) {
+  const seen = new Set();
+  return (Array.isArray(list) ? list : [])
+    .map((item) => safeString(item))
+    .filter((item) => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+const DEFAULT_WEIBO_KEYWORDS = Object.values(INTERESTS).flatMap((words) => words.slice(0, 3));
+const WEIBO_KEYWORDS = uniqueStrings([...RAW_WEIBO_KEYWORDS, ...DEFAULT_WEIBO_KEYWORDS]).slice(0, WEIBO_KEYWORD_LIMIT);
+const KEYWORD_INTERESTS = new Map();
+for (const [key, words] of Object.entries(INTERESTS)) {
+  for (const word of words) {
+    const label = safeString(word).toLowerCase();
+    if (!label) continue;
+    KEYWORD_INTERESTS.set(label, Array.from(new Set([...(KEYWORD_INTERESTS.get(label) || []), key])));
+  }
+}
 
 const nowIso = () => new Date().toISOString();
 
@@ -120,6 +143,24 @@ function classify(item) {
   return Array.from(new Set(tags.length ? tags : ["general"]));
 }
 
+function interestTagsForKeyword(keyword) {
+  const text = safeString(keyword).toLowerCase();
+  if (!text) return [];
+  const direct = KEYWORD_INTERESTS.get(text);
+  if (direct?.length) return direct;
+  const tags = [];
+  for (const [key, words] of Object.entries(INTERESTS)) {
+    if (key === "general") continue;
+    if (words.some((word) => {
+      const label = safeString(word).toLowerCase();
+      return label && (text.includes(label) || label.includes(text));
+    })) {
+      tags.push(key);
+    }
+  }
+  return Array.from(new Set(tags));
+}
+
 function material(input) {
   const source = safeString(input.source, "unknown");
   const title = compactText(input.title || input.word || input.name, 160);
@@ -141,6 +182,7 @@ function material(input) {
     heat: toNumber(input.heat || input.hot || input.view || input.likes, 0),
     likes: toNumber(input.likes || input.like || input.digg, 0),
     comments: toNumber(input.comments || input.reply || input.comment, 0),
+    reposts: toNumber(input.reposts || input.shares || input.share || input.repost, 0),
     publishedAt: input.publishedAt || input.createdAt || nowIso(),
     fetchedAt: nowIso(),
     tags: Array.isArray(input.tags) ? input.tags : []
@@ -188,6 +230,21 @@ async function fetchText(url, options = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function mapWithConcurrency(list, limit, worker) {
+  const items = Array.isArray(list) ? list : [];
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length || 1)) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function sourceBilibiliPopular() {
@@ -278,6 +335,7 @@ function normalizeWeiboStatus(item) {
     heat: item.attitudes_count || item.reposts_count || 0,
     likes: item.attitudes_count,
     comments: item.comments_count,
+    reposts: item.reposts_count,
     publishedAt: item.created_at ? new Date(item.created_at).toISOString() : nowIso(),
     tags: ["social", "weibo"]
   });
@@ -320,22 +378,25 @@ function extractWeiboCards(data) {
 
 async function sourceWeiboSearchPosts() {
   if (!WEIBO_COOKIE || !WEIBO_KEYWORDS.length) return [];
-  const batches = await Promise.all(WEIBO_KEYWORDS.map(async (keyword) => {
-    const pages = await Promise.all(Array.from({ length: WEIBO_SEARCH_PAGES }, async (_, index) => {
+  console.log(`[source-cache] weibo-search-posts keywords=${WEIBO_KEYWORDS.length} pages=${WEIBO_SEARCH_PAGES}`);
+  const batches = await mapWithConcurrency(WEIBO_KEYWORDS, 6, async (keyword) => {
+    const keywordTags = interestTagsForKeyword(keyword);
+    const pages = [];
+    for (let index = 0; index < WEIBO_SEARCH_PAGES; index += 1) {
       const page = index + 1;
       // m.weibo.cn 的 searchall 更接近综合/热门相关排序，不是严格时间倒序广场流。
       const url = `https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26t%3D10%26q%3D${encodeURIComponent(keyword)}&page_type=searchall&page=${page}`;
       const data = await fetchJson(url, { headers: weiboHeaders("https://m.weibo.cn/") });
-      return extractWeiboCards(data).map((item) => {
+      pages.push(extractWeiboCards(data).map((item) => {
         const post = normalizeWeiboStatusDeep(item);
-        if (post) post.tags = Array.from(new Set([...(post.tags || []), keyword]));
+        if (post) post.tags = Array.from(new Set([...(post.tags || []), keyword, ...keywordTags]));
         return post;
-      }).filter(Boolean);
-    }));
+      }).filter(Boolean));
+    }
     const posts = pages.flat();
     console.log(`[source-cache] weibo-search-posts keyword="${keyword}" pages=${WEIBO_SEARCH_PAGES} order=searchall/hot-related count=${posts.length}`);
     return posts;
-  }));
+  });
   return batches.flat();
 }
 
@@ -429,7 +490,12 @@ async function collect() {
       const time = new Date(item.publishedAt || item.fetchedAt).getTime();
       return !Number.isFinite(time) || time >= cutoff;
     })
-    .sort((a, b) => (b.heat || 0) - (a.heat || 0));
+    .sort((a, b) => {
+      const bt = new Date(b.publishedAt || b.fetchedAt).getTime();
+      const at = new Date(a.publishedAt || a.fetchedAt).getTime();
+      const timeDiff = (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+      return timeDiff || ((b.heat || 0) - (a.heat || 0));
+    });
 }
 
 async function writeJson(relativePath, payload) {
